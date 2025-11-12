@@ -9,7 +9,7 @@ You can download the repo and run the main branch with:
 cargo test
 ```
 
-Which is run in release mode by default. This repo requires the nightly toolchain. If you are seeing errors related to:
+Which is run in release mode by default. This repo requires the nightly Rust toolchain. If you are seeing errors related to:
 
 ```bash
 6 | #![feature(specialization)]
@@ -26,7 +26,7 @@ error[E0554]: `#![feature]` may not be used on the stable release channel
   |                                             ^^^^^^^^^^^^^^^^^^
 ```
 
-Then please double check your toolchain. Otherwise, this repo should work out of the box.
+Then please double check your toolchain. You may need to run `rustup update nightly` and ensure the `rustc` component is installed. Otherwise, this repo should work out of the box.
 
 You can also run:
 
@@ -83,9 +83,9 @@ Our approach is to insert the following gates into the circuit with the requisit
                                                     │                      │
                                                     ▼                      │
                                           +-----------------------------+  │
-                                          | 6. process_recursive_layer  |──┘
+                                          | 6. evaluate_recursive_circuit|──┘
                                           |  Handle recursion, verify,  |
-                                          |  and loop through steps.    |
+                                          |  and loop through steps.     |
                                           +-----------------------------+
                                                     │
                                                     ▼
@@ -100,22 +100,22 @@ You can also view a rough sketch of a circuit diagram of the entire setup:
 
 
 ### Initial Setup
-- **Counter Initialization**: A counter gate is initialized to track the depth of recursion.
-- **Hash Initialization**: A virtual hash target gate is inserted and registered as a public input, marking the starting point of the hash chain.
-- **Hash Gate**: An updateable hash gate is added to enable hash updates as the recursion progresses.
+- **Counter Initialization**: A counter gate is initialized to track the depth of recursion. The counter starts at 1 after the base case performs the first hash iteration.
+- **Hash Initialization**: A virtual hash target gate is inserted and registered as a public input, marking the starting point of the hash chain. The initial hash is set to the zero hash `[F::ZERO; 4]` (all zeros).
+- **Hash Gate**: An updateable hash gate is added to enable hash updates as the recursion progresses. The circuit computes `current_hash_out = hash(current_hash_in)`, where `current_hash_in` is either the initial hash (base case) or the previous proof's output hash (recursive case).
 
 ### Recursive Hashing
-- **Verifier Data Setup**: Circuit common data is prepared, including configuration and partial witnesses required for recursion.
-- **Base Case Identification**: A condition is set to identify whether the current computation is the base case or a recursive case.
-- **Hash Chain Connection**: The current hash is connected to the previous hash output or set as the initial hash based on whether it's a base or recursive step.
+- **Verifier Data Setup**: Circuit common data is prepared, including configuration and partial witnesses required for recursion. This sets up the recursive proof structure using plonky2's cyclic recursion capabilities.
+- **Base Case Identification**: A condition flag is set to identify whether the current computation is the base case (`condition=false`) or a recursive case (`condition=true`). In the base case, the hash chain starts with the zero hash. In recursive cases, each proof verifies the previous proof and extends the chain.
+- **Hash Chain Connection**: The current hash input is connected to either the previous proof's output hash (when `condition=true`) or the initial hash (when `condition=false`). The circuit ensures proper chaining by verifying the inner cyclic proof and computing the next hash in the sequence.
 
 ### Recursive Proof Verification
-- **Circuit Building**: The circuit for the current step is built.
-- **Proof Generation**: A proof of the correctness of the current hash computation is generated using the circuit data.
-- **Proof Verification**: The generated proof is verified to ensure that the hash was computed correctly.
+- **Circuit Building**: The circuit for the current step is built with all necessary gates and constraints. The circuit structure remains constant regardless of the number of steps, enabling constant-size proofs.
+- **Proof Generation**: A proof of the correctness of the current hash computation is generated using the circuit data. Each recursive step produces a new proof that verifies the previous proof and extends the hash chain by one iteration.
+- **Proof Verification**: The generated proof is verified to ensure that the hash was computed correctly. The verification process checks both the proof's validity and that the hash chain was computed correctly by comparing against the expected hash value.
 
 ### Final Verification
-- **Final Hash Check**: After all recursive steps, the final hash is compared against the expected result to confirm the integrity of the entire hash chain.
+- **Final Hash Check**: After all recursive steps, the final hash is compared against the expected result to confirm the integrity of the entire hash chain. The `verify` function checks that `current_hash == hash^counter(initial_hash)` by iteratively hashing the initial hash `counter` times and comparing the result. This provides an additional validation beyond the proof verification itself.
 
 ## Usage:
 
@@ -148,11 +148,21 @@ let (proof, circuit_data) =
 
 // Verify
 let verification_result =
-    <CircuitBuilder<GoldilocksField, D> as HashChain<GoldilocksField, D, C>>::verify(proof, circuit_data);
+    <CircuitBuilder<GoldilocksField, D> as HashChain<GoldilocksField, D, C>>::verify(proof, &circuit_data);
 assert!(verification_result.is_ok());
 ```
 
 We observe a total uncompressed proof size of 133440 bytes, regardless of number of steps in the chain. We find this is very nice because this number stays the same no matter how many hashes we compute. In theory, recursively verifiable proofs of this nature can compress extremely large computations into a very small space. Think fully-succinct blockchains, in which light clients can verify the entire state of the chain trustlessly by verifying a small and simple proof in trivial amounts of time.
+
+### Public Inputs Structure
+
+The proof's public inputs follow this structure:
+- `[0..4]`: Initial hash (4 field elements) - remains constant throughout the chain, set to `[F::ZERO; 4]`
+- `[4..8]`: Current hash (4 field elements) - the hash after `counter` iterations
+- `[8]`: Counter (1 field element) - the number of hash iterations performed (starts at 1, increments by 1 each recursive step)
+- `[9..]`: Verifier data (variable length) - plonky2's verifier circuit data
+
+The verification function validates that `current_hash == hash^counter(initial_hash)`, ensuring the hash chain was computed correctly.
 
 ## Benches
 
@@ -161,16 +171,18 @@ This crate uses criterion for formal benchmarks. Bench prover and verifier perfo
 ```bash
 cargo bench
 ```
-Here are some prelimnary performance metrics observed thus far:
+Here are some preliminary performance metrics observed on Apple M4 Pro (Darwin):
 
-| Circuit depth (steps) | Prover Runtime (s) | Verifier Runtime (ms)| System RAM Used (mb)|
-|-----------------------|--------------------|----------------------|---------------------|
-| 2                     | 3.3680 s           | 3.1013 ms            | 375.692             |
-| 4                     | 4.2126 s           | 3.1220 ms            | 381.536             |
-| 8                     | 5.7366 s           | 3.0812 ms            | 392.716             |
-| 16                    | 8.8146 s           | 3.1098 ms            | 405.516             |
-| 32                    | 14.957 s           | 3.0865 ms            | 417.704             |
-| 64                    | 27.294 s           | 3.1625 ms            | 436.424             |
+| Circuit depth (steps) | Prover Runtime (s) | Verifier Runtime (ms)|
+|-----------------------|--------------------|----------------------|
+| 2                     | 2.629 s            | 2.474 ms             |
+| 4                     | 3.163 s            | 2.454 ms             |
+| 8                     | 4.196 s            | 2.491 ms             |
+| 16                    | 6.474 s            | 2.498 ms             |
+| 32                    | 10.77 s            | 2.496 ms             |
+| 64                    | 18.78 s            | 2.518 ms             |
+
+**Key Observation**: Verifier runtime remains constant (~2.5ms) regardless of chain length, demonstrating the succinctness property of recursive proofs. Prover time scales roughly linearly with the number of steps.
 
 
 ## Acknowledgments

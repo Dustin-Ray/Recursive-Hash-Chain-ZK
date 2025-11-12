@@ -21,6 +21,7 @@ structopt = { version = "0.3.26", default-features = false }
 env_logger = "0.11.5"
 thiserror = "1.0.63"
 criterion = "0.3"
+hashbrown = "0.14"
 
 [dev-dependencies]
 debug_print = { version = "1.0.0" }

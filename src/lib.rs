@@ -83,6 +83,9 @@ pub trait HashChain<F: RichField + Extendable<D>, const D: usize, C: GenericConf
         proof: Proof<F, C, D>,
         verifier_data_target: VerifierCircuitTarget,
         cyclic_circuit_data: &CircuitMap<F, C, D>,
+        initial_hash_target: HashOutTarget,
+        current_hash_out: HashOutTarget,
+        counter: Target,
     ) -> Result<Proof<F, C, D>, HashChainError>;
 
     fn configure_layers() -> CommonData<F, D>;
@@ -93,6 +96,9 @@ pub trait HashChain<F: RichField + Extendable<D>, const D: usize, C: GenericConf
         common_data: CommonData<F, D>,
         cyclic_circuit_data: CircuitMap<F, C, D>,
         verifier_data_target: VerifierCircuitTarget,
+        initial_hash_target: HashOutTarget,
+        current_hash_out: HashOutTarget,
+        counter: Target,
         steps: usize,
     ) -> ProofAndCircuitResult<F, C, D>;
 }
@@ -143,7 +149,8 @@ where
     /// ```
     ///
     /// Following this approach, we can build a properly constrained recursive hash chain
-    /// circuit. (At least thats the plan!)
+    /// circuit. The implementation uses plonky2's cyclic recursion to create a constant-size
+    /// proof that verifies an arbitrary number of hash iterations.
     ///
     /// ## Usage
     /// ```
@@ -262,6 +269,9 @@ where
             common_data,
             cyclic_circuit_data,
             verifier_data_target,
+            initial_hash_target,
+            current_hash_out,
+            counter,
             steps,
         )
     }
@@ -269,6 +279,12 @@ where
     // Setup the recursive hashes structure by establishing the size of the inputs and outputs
     // and connecting them to each other appropriately. Additionally setup the conditional proof
     // verification depending on whether we are in the base layer or not.
+    //
+    // The circuit connects:
+    // - initial_hash_target to inner_cyclic_initial_hash (ensures initial hash stays constant)
+    // - current_hash_in to either inner_cyclic_latest_hash (if condition=true) or initial_hash_target (if condition=false)
+    // - counter to condition * inner_cyclic_counter + 1 (increments counter when condition=true)
+    // This ensures proper hash chaining: each recursive step uses the previous proof's output hash as input.
     fn setup_recursive_layers(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -338,11 +354,38 @@ where
         proof: ProofWithPublicInputs<F, C, D>,
         verifier_circuit_target: VerifierCircuitTarget,
         cyclic_circuit_data: &CircuitData<F, C, D>,
+        initial_hash_target: HashOutTarget,
+        _current_hash_out: HashOutTarget,
+        counter: Target,
     ) -> Result<ProofWithPublicInputs<F, C, D>, HashChainError> {
         let mut pw = PartialWitness::new();
         pw.set_bool_target(condition, true);
         pw.set_proof_with_pis_target(&inner_cyclic_proof_with_pub_inputs, &proof);
         pw.set_verifier_data_target(&verifier_circuit_target, &cyclic_circuit_data.verifier_only);
+
+        // Set the public inputs from the previous proof to ensure proper chaining
+        // Public inputs structure: [initial_hash (4), current_hash (4), counter (1), ...verifier_data...]
+        // Note: The circuit connects these via setup_recursive_layers, but we need to set
+        // the initial values to match the previous proof's outputs
+        let prev_initial_hash = &proof.public_inputs[0..4];
+        let prev_counter = proof.public_inputs[8];
+
+        // Set initial hash (should remain constant across all iterations)
+        for (i, &element) in prev_initial_hash.iter().enumerate() {
+            pw.set_target(initial_hash_target.elements[i], element);
+        }
+
+        // Set counter to match what the circuit will compute
+        // The circuit computes: counter = condition * inner_counter + 1
+        // Since condition=true, this becomes: counter = inner_counter + 1
+        // We need to set it to prev_counter + 1 to match the circuit's computation
+        let one = F::ONE;
+        pw.set_target(counter, prev_counter + one);
+
+        // Note: current_hash_out is computed by the circuit from current_hash_in,
+        // which is connected to inner_cyclic_latest_hash from the previous proof.
+        // We don't need to set it explicitly - the circuit handles the chaining.
+
         let proof = cyclic_circuit_data.prove(pw)?;
         check_cyclic_proof_verifier_data(
             &proof,
@@ -362,24 +405,50 @@ where
         common_data: CommonCircuitData<F, D>,
         cyclic_circuit_data: CircuitData<F, C, D>,
         verifier_data_target: VerifierCircuitTarget,
+        initial_hash_target: HashOutTarget,
+        current_hash_out: HashOutTarget,
+        counter: Target,
         steps: usize,
     ) -> Result<(ProofWithPublicInputs<F, C, D>, CircuitData<F, C, D>), HashChainError> {
         // Setup the partial witness for the proof, and set the
-        // initial public input wires with an array of field elements set to
-        // the empty hash
+        // initial public input wires with actual hash values
+        // Use zero hash as the starting point (all zeros)
         let mut pw = PartialWitness::new();
-        let initial_hash = [];
-        let initial_hash_pub_inputs = initial_hash.into_iter().enumerate().collect();
+        let initial_hash: [F; 4] = [F::ZERO; 4];
+
+        // Set the initial hash in the witness (starting point of the chain)
+        for (i, &element) in initial_hash.iter().enumerate() {
+            pw.set_target(initial_hash_target.elements[i], element);
+        }
+
+        // Compute the first hash (base case: hash the initial hash once)
+        let first_hash = hash_n_to_hash_no_pad::<F, PoseidonPermutation<F>>(&initial_hash);
+
+        // Set counter to 1 (we've done one hash iteration)
+        // Note: current_hash_out will be computed by the circuit from current_hash_in
+        // In the base case (condition=false), current_hash_in = initial_hash_target
+        // So current_hash_out = hash(initial_hash) = first_hash
+        let one = F::ONE;
+        pw.set_target(counter, one);
 
         // Set the condition wire to false because we are not in the recursive case
         // initially
         pw.set_bool_target(condition, false);
+
+        // Create base proof with proper public inputs: [initial_hash (4), current_hash (4), counter (1)]
+        let mut base_pub_inputs = Vec::new();
+        base_pub_inputs.extend_from_slice(&initial_hash);
+        base_pub_inputs.extend_from_slice(&first_hash.elements);
+        base_pub_inputs.push(one);
+        let base_pub_inputs_map: hashbrown::HashMap<usize, F> =
+            base_pub_inputs.into_iter().enumerate().collect();
+
         pw.set_proof_with_pis_target::<C, D>(
             &inner_cyclic_proof_with_pub_inputs,
             &cyclic_base_proof(
                 &common_data,
                 &cyclic_circuit_data.verifier_only,
-                initial_hash_pub_inputs,
+                base_pub_inputs_map,
             ),
         );
 
@@ -392,7 +461,7 @@ where
 
         // Setup the expected data for the verifier
         pw.set_verifier_data_target(&verifier_data_target, &cyclic_circuit_data.verifier_only);
-        let proof = cyclic_circuit_data.prove(pw)?;
+        let mut proof = cyclic_circuit_data.prove(pw)?;
         check_cyclic_proof_verifier_data(
             &proof,
             &cyclic_circuit_data.verifier_only,
@@ -400,17 +469,20 @@ where
         )?;
         cyclic_circuit_data.verify(proof.clone())?;
 
-        // Base case of the recursion
-        let mut proof = Self::prove_current_layer(
+        // Base case of the recursion - now prove with condition=true to start recursive chaining
+        proof = Self::prove_current_layer(
             condition,
             inner_cyclic_proof_with_pub_inputs.clone(),
             proof,
             verifier_data_target.clone(),
             &cyclic_circuit_data,
+            initial_hash_target,
+            current_hash_out,
+            counter,
         )?;
         cyclic_circuit_data.verify(proof.clone())?;
 
-        // Subsequent recursive steps
+        // Subsequent recursive steps - each step chains the previous hash
         for _ in 0..steps {
             proof = Self::prove_current_layer(
                 condition,
@@ -418,6 +490,9 @@ where
                 proof,
                 verifier_data_target.clone(),
                 &cyclic_circuit_data,
+                initial_hash_target,
+                current_hash_out,
+                counter,
             )?;
         }
 
@@ -491,7 +566,7 @@ mod tests {
             GoldilocksField,
             D,
             C,
-        >>::build_hash_chain_circuit(&mut circuit, 2)
+        >>::build_hash_chain_circuit(&mut circuit, 128)
         .unwrap();
 
         let result =
